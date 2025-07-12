@@ -7,11 +7,12 @@ This was created for my own personal use, and is provided "as is".
 ## Features
 
 - Routes JSON-RPC requests to a **primary Ethereum node** or **backup nodes**
-- **Health checks** based on `eth_blockNumber`
+- **Health checks** based on `eth_blockNumber` with configurable timeout
 - Detects **out-of-sync or unreachable nodes**
 - Customizable **block lag tolerance**
-- **Timeout control** for node health checks and forwarding
-- Optional **verbose logging** for debugging and monitoring
+- **Separate timeouts** for health checks and request forwarding
+- **Structured logging** with configurable log levels
+- **Error logging** to stderr, info logging to stdout
 
 ## Usage
 
@@ -21,11 +22,10 @@ The proxy server can be configured using the following command line flags:
 
 | Flag | Description                                   | Default                                                             |
 | ---- | --------------------------------------------- | ------------------------------------------------------------------- |
-| `-v` | Enable verbose logging                        | `false`                                                             |
-| `-d` | Enable debug logging (requests and responses) | `false`                                                             |
+| `-l` | Log level (debug, info, warn, error)          | `info`                                                              |
 | `-p` | Port to listen on                             | `9545`                                                              |
-| `-t` | Timeout in seconds for RPC requests           | `3`                                                                 |
-| `-b` | Block lag limit tolerance                     | `32`                                                                |
+| `-t` | Health check timeout in milliseconds          | `500`                                                               |
+| `-b` | Block lag limit tolerance                     | `16`                                                                |
 | `-u` | Node URLs (comma-separated, first is primary) | `http://localhost:8545,http://localhost:8546,http://localhost:8547` |
 
 ### Basic Usage
@@ -42,13 +42,19 @@ Configure custom nodes and settings:
 
 ```bash
 go run rpcproxy.go \
-  -v \
-  -d \
+  -l debug \
   -p 8080 \
-  -t 5 \
+  -t 1000 \
   -b 16 \
   -u "http://primary-node:8545,http://backup1:8545,http://backup2:8545"
 ```
+
+### Log Levels
+
+- **debug**: Shows all log messages (DEBUG, INFO, WARN, ERROR)
+- **info**: Shows INFO, WARN, and ERROR messages (default)
+- **warn**: Shows only WARN and ERROR messages
+- **error**: Shows only ERROR messages
 
 ### Make JSON-RPC Requests
 
@@ -68,9 +74,9 @@ curl -X POST http://localhost:9545 \
    - Which nodes are healthy (HTTP 200 OK and responsive).
    - The highest block height across all nodes.
 
-3. If the **primary node** is healthy and within 32 blocks (configurable) of the highest block:
+3. If the **primary node** is healthy and within the configured block lag limit of the highest block:
 
-   - The request is forwarded to the primary.
+   - The request is forwarded to the primary with a 30-second timeout.
 
 4. If the primary is down or out-of-sync:
 
@@ -78,7 +84,7 @@ curl -X POST http://localhost:9545 \
 
 ## Dependencies
 
-- Go 1.18 or higher (standard library only)
+- Go 1.21 or higher (standard library only)
 
 ## License
 

@@ -8,17 +8,21 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"log/slog"
 )
 
 type Config struct {
-	PrimaryNode   string
-	BackupNodes   []string
-	Timeout       time.Duration
-	BlockLagLimit int64
+	PrimaryNode        string
+	BackupNodes        []string
+	HealthCheckTimeout time.Duration
+	RequestTimeout     time.Duration
+	BlockLagLimit      int64
 }
 
 type JSONRPCRequest struct {
@@ -35,28 +39,12 @@ type JSONRPCResponse struct {
 	ID      uint64          `json:"id"`
 }
 
-var verbose bool
-var debug bool
-
-type Logger struct {
-	verbose bool
-}
-
-func NewLogger(verbose bool) *Logger {
-	return &Logger{verbose: verbose}
-}
-
-func (l *Logger) Log(format string, args ...interface{}) {
-	if l.verbose {
-		log.Printf(format, args...)
-	}
-}
-
-func (l *Logger) Logln(args ...interface{}) {
-	if l.verbose {
-		log.Println(args...)
-	}
-}
+var (
+	config            Config
+	logger            *slog.Logger
+	healthCheckClient *HTTPClient
+	requestClient     *HTTPClient
+)
 
 type HTTPClient struct {
 	client *http.Client
@@ -80,16 +68,18 @@ func (hc *HTTPClient) Post(url string, contentType string, body io.Reader) (*htt
 }
 
 func main() {
-	var port int
-	var timeout int
-	var blockLagLimit int
-	var nodes string
+	var (
+		port          int
+		timeout       int
+		blockLagLimit int
+		nodes         string
+		logLevel      string
+	)
 
-	flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
-	flag.BoolVar(&debug, "d", false, "Enable debug logging (logs requests and responses)")
+	flag.StringVar(&logLevel, "l", "info", "Log level (debug, info, warn, error)")
 	flag.IntVar(&port, "p", 9545, "Port to listen on")
-	flag.IntVar(&timeout, "t", 3, "Timeout in seconds")
-	flag.IntVar(&blockLagLimit, "b", 32, "Block lag limit")
+	flag.IntVar(&timeout, "t", 500, "Timeout in ms for health-check requests")
+	flag.IntVar(&blockLagLimit, "b", 16, "Block lag limit")
 	flag.StringVar(&nodes, "u", "http://localhost:8545,http://localhost:8546,http://localhost:8547", "Node URLs (comma-separated, first is primary)")
 
 	flag.Parse()
@@ -99,66 +89,71 @@ func main() {
 		log.Fatal("At least one node URL must be provided")
 	}
 
-	config := Config{
-		PrimaryNode:   nodeList[0],
-		BackupNodes:   nodeList[1:],
-		Timeout:       time.Duration(timeout) * time.Second,
-		BlockLagLimit: int64(blockLagLimit),
+	config = Config{
+		PrimaryNode:        nodeList[0],
+		BackupNodes:        nodeList[1:],
+		HealthCheckTimeout: time.Duration(timeout) * time.Millisecond,
+		RequestTimeout:     30 * time.Second,
+		BlockLagLimit:      int64(blockLagLimit),
 	}
 
-	logger := NewLogger(verbose)
-	debugLogger := NewLogger(debug)
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(logLevel)); err != nil {
+		log.Fatalf("Invalid log level: %s. Must be one of: debug, info, warn, error", logLevel)
+	}
 
-	httpClient := NewHTTPClient(config.Timeout)
+	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+
+	healthCheckClient = NewHTTPClient(config.HealthCheckTimeout)
+	requestClient = NewHTTPClient(config.RequestTimeout)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handleRequest(w, r, config, logger, debugLogger, httpClient)
+		handleRequest(w, r)
 	})
 
-	log.Println("Proxy server listening on port", port)
-	logger.Logln("Primary node:", config.PrimaryNode)
-	logger.Logln("Backup nodes:", strings.Join(config.BackupNodes, ", "))
+	logArgs := []any{slog.Int("port", port), slog.String("node0", config.PrimaryNode)}
+	for i, u := range config.BackupNodes {
+		logArgs = append(logArgs, slog.String("node"+strconv.Itoa(i+1), u))
+	}
+	logger.Info("rpcproxy started", logArgs...)
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
 }
 
-func handleRequest(w http.ResponseWriter, r *http.Request, config Config, logger *Logger, debugLogger *Logger, httpClient *HTTPClient) {
+func handleRequest(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		debugLogger.Logln("=== Outgoing Response (Error) ===")
-		debugLogger.Logln("Status: 400 Bad Request")
-		debugLogger.Logln("Error: Failed to read request")
 		http.Error(w, "Failed to read request", http.StatusBadRequest)
+		logger.Error("Failed to read request body", slog.Any("error", err))
+		logger.Debug("Outgoing response", slog.Int("status", http.StatusBadRequest))
 		return
 	}
 	defer r.Body.Close()
 
-	debugLogger.Logln("=== Incoming Request ===")
-	debugLogger.Logln("Method:", r.Method)
-	debugLogger.Logln("URL:", r.URL.String())
-	debugLogger.Logln("Headers:", r.Header)
-	debugLogger.Logln("Body:", string(body))
+	logger.Debug("Incoming request",
+		slog.String("method", r.Method),
+		slog.String("url", r.URL.String()),
+		slog.Any("headers", r.Header),
+		slog.String("body", string(body)))
 
 	if len(body) > 0 && body[0] == '[' {
 		if err := json.Unmarshal(body, &[]JSONRPCRequest{}); err != nil {
-			debugLogger.Logln("=== Outgoing Response (Error) ===")
-			debugLogger.Logln("Status: 400 Bad Request")
-			debugLogger.Logln("Error: Invalid JSON-RPC batch request")
 			http.Error(w, "Invalid JSON-RPC batch request", http.StatusBadRequest)
+			logger.Error("Invalid JSON-RPC batch request", slog.Any("error", err))
+			logger.Debug("Outgoing response", slog.Int("status", http.StatusBadRequest))
 			return
 		}
 	} else {
 		if err := json.Unmarshal(body, &JSONRPCRequest{}); err != nil {
-			debugLogger.Logln("=== Outgoing Response (Error) ===")
-			debugLogger.Logln("Status: 400 Bad Request")
-			debugLogger.Logln("Error: Invalid JSON-RPC request")
 			http.Error(w, "Invalid JSON-RPC request", http.StatusBadRequest)
+			logger.Error("Invalid JSON-RPC request", slog.Any("error", err))
+			logger.Debug("Outgoing response", slog.Int("status", http.StatusBadRequest))
 			return
 		}
 	}
 
 	nodes := append([]string{config.PrimaryNode}, config.BackupNodes...)
-	heights, healthy := getNodeHeights(nodes, logger, httpClient)
+	heights, healthy := getNodeHeights(nodes)
 
 	maxHeight := int64(0)
 	for _, h := range heights {
@@ -167,30 +162,26 @@ func handleRequest(w http.ResponseWriter, r *http.Request, config Config, logger
 		}
 	}
 
-	logger.Logln("Node block heights:")
+	logArgs := []any{slog.Int64("max_height", maxHeight)}
 	for i, h := range heights {
-		status := "unreachable"
+		nodeLabel := "node" + strconv.Itoa(i)
 		if healthy[i] {
-			status = "healthy"
+			logArgs = append(logArgs, slog.Int64(nodeLabel, h))
+		} else {
+			logArgs = append(logArgs, slog.String(nodeLabel, "unreachable"))
 		}
-		nodeLabel := "Primary"
-		if i > 0 {
-			nodeLabel = "Backup " + strconv.Itoa(i)
-		}
-		logger.Log("  %s: %d (%s)", nodeLabel, h, status)
 	}
+	logger.Info("Node block heights", logArgs...)
 
 	if healthy[0] && maxHeight-heights[0] <= config.BlockLagLimit {
-		logger.Logln("Forwarding request to primary node")
-		resp, err := forwardRequest(config.PrimaryNode, body, httpClient)
+		logger.Info("Forwarding request to primary node")
+		resp, err := forwardRequest(config.PrimaryNode, body)
 		if err == nil {
-			debugLogger.Logln("=== Outgoing Response (Primary) ===")
-			debugLogger.Logln("Status: 200 OK")
-			debugLogger.Logln("Response Body:", string(resp))
+			logger.Debug("Outgoing response", slog.Int("status", http.StatusOK), slog.String("body", string(resp)))
 			w.Write(resp)
 			return
 		}
-		logger.Logln("Primary node failed. Falling back.")
+		logger.Error("Primary node failed", slog.Any("error", err))
 	}
 
 	bestIndex := -1
@@ -203,30 +194,27 @@ func handleRequest(w http.ResponseWriter, r *http.Request, config Config, logger
 	}
 
 	if bestIndex == -1 {
-		debugLogger.Logln("=== Outgoing Response (Error) ===")
-		debugLogger.Logln("Status: 503 Service Unavailable")
-		debugLogger.Logln("Error: All nodes unavailable")
 		http.Error(w, "All nodes unavailable", http.StatusServiceUnavailable)
+		logger.Error("All nodes unavailable - no healthy backup nodes found")
+		logger.Debug("Outgoing response", slog.Int("status", http.StatusServiceUnavailable))
 		return
 	}
 
-	logger.Log("Forwarding request to backup node #%d", bestIndex)
+	logger.Info("Forwarding request to backup node", slog.Int("index", bestIndex))
 
-	resp, err := forwardRequest(nodes[bestIndex], body, httpClient)
+	resp, err := forwardRequest(nodes[bestIndex], body)
 	if err != nil {
-		debugLogger.Logln("=== Outgoing Response (Error) ===")
-		debugLogger.Logln("Status: 502 Bad Gateway")
-		debugLogger.Logln("Error:", err.Error())
 		http.Error(w, "Failed to forward request", http.StatusBadGateway)
+		logger.Error("Failed to forward request to backup node", slog.Int("index", bestIndex), slog.Any("error", err))
+		logger.Debug("Outgoing response", slog.Int("status", http.StatusBadGateway))
 		return
 	}
-	debugLogger.Logln("=== Outgoing Response (Backup) ===")
-	debugLogger.Logln("Status: 200 OK")
-	debugLogger.Logln("Response Body:", string(resp))
+
 	w.Write(resp)
+	logger.Debug("Outgoing response", slog.Int("status", http.StatusOK), slog.String("body", string(resp)))
 }
 
-func getNodeHeights(nodes []string, logger *Logger, httpClient *HTTPClient) ([]int64, []bool) {
+func getNodeHeights(nodes []string) ([]int64, []bool) {
 	type result struct {
 		index  int
 		height int64
@@ -240,9 +228,9 @@ func getNodeHeights(nodes []string, logger *Logger, httpClient *HTTPClient) ([]i
 		wg.Add(1)
 		go func(index int, url string) {
 			defer wg.Done()
-			height, err := getBlockHeight(url, httpClient)
+			height, err := getBlockHeight(url, healthCheckClient)
 			if err != nil {
-				logger.Log("Error querying node #%d: %v", index, err)
+				logger.Error("Error querying node", slog.Int("index", index), slog.String("url", url), slog.Any("error", err))
 			}
 			results <- result{index, height, err == nil}
 		}(i, node)
@@ -295,8 +283,8 @@ func getBlockHeight(url string, httpClient *HTTPClient) (int64, error) {
 	return strconv.ParseInt(hexNum[2:], 16, 64)
 }
 
-func forwardRequest(url string, body []byte, httpClient *HTTPClient) ([]byte, error) {
-	resp, err := httpClient.Post(url, "application/json", bytes.NewBuffer(body))
+func forwardRequest(url string, body []byte) ([]byte, error) {
+	resp, err := requestClient.Post(url, "application/json", bytes.NewBuffer(body))
 	if err != nil {
 		return nil, err
 	}
