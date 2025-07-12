@@ -139,13 +139,22 @@ func handleRequest(w http.ResponseWriter, r *http.Request, config Config, logger
 	debugLogger.Logln("Headers:", r.Header)
 	debugLogger.Logln("Body:", string(body))
 
-	var req JSONRPCRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		debugLogger.Logln("=== Outgoing Response (Error) ===")
-		debugLogger.Logln("Status: 400 Bad Request")
-		debugLogger.Logln("Error: Invalid JSON-RPC request")
-		http.Error(w, "Invalid JSON-RPC request", http.StatusBadRequest)
-		return
+	if len(body) > 0 && body[0] == '[' {
+		if err := json.Unmarshal(body, &[]JSONRPCRequest{}); err != nil {
+			debugLogger.Logln("=== Outgoing Response (Error) ===")
+			debugLogger.Logln("Status: 400 Bad Request")
+			debugLogger.Logln("Error: Invalid JSON-RPC batch request")
+			http.Error(w, "Invalid JSON-RPC batch request", http.StatusBadRequest)
+			return
+		}
+	} else {
+		if err := json.Unmarshal(body, &JSONRPCRequest{}); err != nil {
+			debugLogger.Logln("=== Outgoing Response (Error) ===")
+			debugLogger.Logln("Status: 400 Bad Request")
+			debugLogger.Logln("Error: Invalid JSON-RPC request")
+			http.Error(w, "Invalid JSON-RPC request", http.StatusBadRequest)
+			return
+		}
 	}
 
 	nodes := append([]string{config.PrimaryNode}, config.BackupNodes...)
