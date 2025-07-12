@@ -19,13 +19,14 @@ This was created for my own personal use, and is provided "as is".
 
 The proxy server can be configured using the following command line flags:
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-v` | Enable verbose logging | `false` |
-| `-p` | Port to listen on | `9545` |
-| `-t` | Timeout in seconds for RPC requests | `3` |
-| `-b` | Block lag limit tolerance | `32` |
-| `-u` | Node URLs (comma-separated, first is primary) | `http://localhost:8545,http://localhost:8546,http://localhost:8547` |
+| Flag | Description                                        | Default                                                             |
+| ---- | -------------------------------------------------- | ------------------------------------------------------------------- |
+| `-v` | Enable verbose logging                             | `false`                                                             |
+| `-d` | Enable debug logging (logs requests and responses) | `false`                                                             |
+| `-p` | Port to listen on                                  | `9545`                                                              |
+| `-t` | Timeout in seconds for RPC requests                | `3`                                                                 |
+| `-b` | Block lag limit tolerance                          | `32`                                                                |
+| `-u` | Node URLs (comma-separated, first is primary)      | `http://localhost:8545,http://localhost:8546,http://localhost:8547` |
 
 ### Basic Usage
 

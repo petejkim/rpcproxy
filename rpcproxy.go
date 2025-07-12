@@ -36,6 +36,7 @@ type JSONRPCResponse struct {
 }
 
 var verbose bool
+var debug bool
 
 type Logger struct {
 	verbose bool
@@ -85,10 +86,12 @@ func main() {
 	var nodes string
 
 	flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
+	flag.BoolVar(&debug, "d", false, "Enable debug logging (logs requests and responses)")
 	flag.IntVar(&port, "p", 9545, "Port to listen on")
 	flag.IntVar(&timeout, "t", 3, "Timeout in seconds")
 	flag.IntVar(&blockLagLimit, "b", 32, "Block lag limit")
 	flag.StringVar(&nodes, "u", "http://localhost:8545,http://localhost:8546,http://localhost:8547", "Node URLs (comma-separated, first is primary)")
+
 	flag.Parse()
 
 	nodeList := strings.Split(nodes, ",")
@@ -104,11 +107,12 @@ func main() {
 	}
 
 	logger := NewLogger(verbose)
+	debugLogger := NewLogger(debug)
 
 	httpClient := NewHTTPClient(config.Timeout)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handleRequest(w, r, config, logger, httpClient)
+		handleRequest(w, r, config, logger, debugLogger, httpClient)
 	})
 
 	log.Println("Proxy server listening on port", port)
@@ -118,16 +122,28 @@ func main() {
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
 }
 
-func handleRequest(w http.ResponseWriter, r *http.Request, config Config, logger *Logger, httpClient *HTTPClient) {
+func handleRequest(w http.ResponseWriter, r *http.Request, config Config, logger *Logger, debugLogger *Logger, httpClient *HTTPClient) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		debugLogger.Logln("=== Outgoing Response (Error) ===")
+		debugLogger.Logln("Status: 400 Bad Request")
+		debugLogger.Logln("Error: Failed to read request")
 		http.Error(w, "Failed to read request", http.StatusBadRequest)
 		return
 	}
 	defer r.Body.Close()
 
+	debugLogger.Logln("=== Incoming Request ===")
+	debugLogger.Logln("Method:", r.Method)
+	debugLogger.Logln("URL:", r.URL.String())
+	debugLogger.Logln("Headers:", r.Header)
+	debugLogger.Logln("Body:", string(body))
+
 	var req JSONRPCRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		debugLogger.Logln("=== Outgoing Response (Error) ===")
+		debugLogger.Logln("Status: 400 Bad Request")
+		debugLogger.Logln("Error: Invalid JSON-RPC request")
 		http.Error(w, "Invalid JSON-RPC request", http.StatusBadRequest)
 		return
 	}
@@ -159,6 +175,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request, config Config, logger
 		logger.Logln("Forwarding request to primary node")
 		resp, err := forwardRequest(config.PrimaryNode, body, httpClient)
 		if err == nil {
+			debugLogger.Logln("=== Outgoing Response (Primary) ===")
+			debugLogger.Logln("Status: 200 OK")
+			debugLogger.Logln("Response Body:", string(resp))
 			w.Write(resp)
 			return
 		}
@@ -175,6 +194,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request, config Config, logger
 	}
 
 	if bestIndex == -1 {
+		debugLogger.Logln("=== Outgoing Response (Error) ===")
+		debugLogger.Logln("Status: 503 Service Unavailable")
+		debugLogger.Logln("Error: All nodes unavailable")
 		http.Error(w, "All nodes unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -183,9 +205,15 @@ func handleRequest(w http.ResponseWriter, r *http.Request, config Config, logger
 
 	resp, err := forwardRequest(nodes[bestIndex], body, httpClient)
 	if err != nil {
+		debugLogger.Logln("=== Outgoing Response (Error) ===")
+		debugLogger.Logln("Status: 502 Bad Gateway")
+		debugLogger.Logln("Error:", err.Error())
 		http.Error(w, "Failed to forward request", http.StatusBadGateway)
 		return
 	}
+	debugLogger.Logln("=== Outgoing Response (Backup) ===")
+	debugLogger.Logln("Status: 200 OK")
+	debugLogger.Logln("Response Body:", string(resp))
 	w.Write(resp)
 }
 
