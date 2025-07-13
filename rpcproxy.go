@@ -18,8 +18,7 @@ import (
 )
 
 type Config struct {
-	PrimaryNode        string
-	BackupNodes        []string
+	Nodes              []string
 	HealthCheckTimeout time.Duration
 	RequestTimeout     time.Duration
 	BlockLagLimit      int64
@@ -90,8 +89,7 @@ func main() {
 	}
 
 	config = Config{
-		PrimaryNode:        nodeList[0],
-		BackupNodes:        nodeList[1:],
+		Nodes:              nodeList,
 		HealthCheckTimeout: time.Duration(timeout) * time.Millisecond,
 		RequestTimeout:     30 * time.Second,
 		BlockLagLimit:      int64(blockLagLimit),
@@ -111,9 +109,9 @@ func main() {
 		handleRequest(w, r)
 	})
 
-	logArgs := []any{slog.Int("port", port), slog.String("node0", config.PrimaryNode)}
-	for i, u := range config.BackupNodes {
-		logArgs = append(logArgs, slog.String("node"+strconv.Itoa(i+1), u))
+	logArgs := []any{slog.Int("port", port)}
+	for i, u := range config.Nodes {
+		logArgs = append(logArgs, slog.String("node"+strconv.Itoa(i), u))
 	}
 	logger.Info("rpcproxy started", logArgs...)
 
@@ -152,8 +150,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	nodes := append([]string{config.PrimaryNode}, config.BackupNodes...)
-	heights, healthy := getNodeHeights(nodes)
+	heights, healthy := getNodeHeights(config.Nodes)
 
 	maxHeight := int64(0)
 	for _, h := range heights {
@@ -164,48 +161,39 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	logArgs := []any{slog.Int64("max_height", maxHeight)}
 	for i, h := range heights {
-		nodeLabel := "node" + strconv.Itoa(i)
+		label := "node" + strconv.Itoa(i)
 		if healthy[i] {
-			logArgs = append(logArgs, slog.Int64(nodeLabel, h))
+			logArgs = append(logArgs, slog.Int64(label, h))
 		} else {
-			logArgs = append(logArgs, slog.String(nodeLabel, "unreachable"))
+			logArgs = append(logArgs, slog.String(label, "unreachable"))
 		}
 	}
 	logger.Info("Node block heights", logArgs...)
 
+	targetNode := 0
+
 	if healthy[0] && maxHeight-heights[0] <= config.BlockLagLimit {
 		logger.Info("Forwarding request to primary node")
-		resp, err := forwardRequest(config.PrimaryNode, body)
-		if err == nil {
-			logger.Debug("Outgoing response", slog.Int("status", http.StatusOK), slog.String("body", string(resp)))
-			w.Write(resp)
-			return
+	} else {
+		bestHeight := int64(-1)
+		for i := 1; i < len(config.Nodes); i++ {
+			if healthy[i] && heights[i] > bestHeight {
+				bestHeight = heights[i]
+				targetNode = i
+			}
 		}
-		logger.Error("Primary node failed", slog.Any("error", err))
-	}
 
-	bestIndex := -1
-	bestHeight := int64(-1)
-	for i := 1; i < len(nodes); i++ {
-		if healthy[i] && heights[i] > bestHeight {
-			bestHeight = heights[i]
-			bestIndex = i
+		if targetNode == 0 {
+			logger.Error("All backup nodes unavailable, attempting to proxy to primary node anyway")
+		} else {
+			logger.Info("Forwarding request to backup node", slog.Int("node", targetNode))
 		}
 	}
 
-	if bestIndex == -1 {
-		http.Error(w, "All nodes unavailable", http.StatusServiceUnavailable)
-		logger.Error("All nodes unavailable - no healthy backup nodes found")
-		logger.Debug("Outgoing response", slog.Int("status", http.StatusServiceUnavailable))
-		return
-	}
-
-	logger.Info("Forwarding request to backup node", slog.Int("index", bestIndex))
-
-	resp, err := forwardRequest(nodes[bestIndex], body)
+	resp, err := forwardRequest(config.Nodes[targetNode], body)
 	if err != nil {
 		http.Error(w, "Failed to forward request", http.StatusBadGateway)
-		logger.Error("Failed to forward request to backup node", slog.Int("index", bestIndex), slog.Any("error", err))
+		logger.Error("Failed to forward request", slog.Int("node", targetNode), slog.Any("error", err))
 		logger.Debug("Outgoing response", slog.Int("status", http.StatusBadGateway))
 		return
 	}
